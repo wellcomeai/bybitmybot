@@ -160,24 +160,66 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
                 break
                 
     async def _handle_message(self, message: str):
-        """Обработка входящего сообщения"""
+        """Обработка входящего сообщения - УЛУЧШЕННАЯ ДИАГНОСТИКА"""
         try:
             data = json.loads(message)
             self.total_messages += 1
             self.last_update = datetime.now()
             
-            # Логируем сырые данные для дебага только если уровень DEBUG
-            if self.logger.isEnabledFor(10):  # DEBUG level
-                self.logger.debug(f"📨 Получено сообщение: {message[:100]}...")
+            # Диагностическое логирование для первых 5 сообщений
+            if self.total_messages <= 5:
+                self.logger.info(f"📨 Сообщение #{self.total_messages} от Bybit:")
+                self.logger.info(f"    📋 Тип: {type(data)}")
+                self.logger.info(f"    📋 Ключи: {list(data.keys()) if isinstance(data, dict) else 'не словарь'}")
+                self.logger.info(f"    📋 Размер: {len(message)} символов")
+                if isinstance(data, dict):
+                    if "topic" in data:
+                        self.logger.info(f"    🎯 Topic: {data['topic']}")
+                    if "type" in data:
+                        self.logger.info(f"    🔄 Type: {data['type']}")
+                    if "op" in data:
+                        self.logger.info(f"    ⚙️ Operation: {data['op']}")
+                
+            # Логируем сырые данные только для тикер сообщений при DEBUG уровне
+            if self.logger.isEnabledFor(10) and isinstance(data, dict):
+                if "topic" in data and "tickers" in data.get("topic", ""):
+                    self.logger.debug(f"📨 Тикер сообщение: {message[:200]}...")
+                elif "op" in data:
+                    self.logger.debug(f"📨 Операционное сообщение: {message}")
             
             # Обрабатываем данные тикеров
             if self._is_ticker_data(data):
                 await self._handle_ticker_data(data)
+            else:
+                # Логируем другие типы сообщений для диагностики
+                if isinstance(data, dict):
+                    if "op" in data:
+                        op = data.get("op")
+                        if op == "pong":
+                            self.logger.debug("🏓 Получен pong от Bybit")
+                        elif op == "subscribe":
+                            success = data.get("success", False)
+                            ret_msg = data.get("ret_msg", "")
+                            if success:
+                                self.logger.info(f"✅ Подписка подтверждена: {ret_msg}")
+                            else:
+                                self.logger.error(f"❌ Ошибка подписки: {ret_msg}")
+                        else:
+                            self.logger.debug(f"📩 Операционное сообщение: {op}")
+                    else:
+                        # Неизвестный формат сообщения
+                        self.logger.warning(f"❓ Неизвестный формат сообщения: {list(data.keys())}")
+                        if self.total_messages <= 10:  # Логируем первые 10 для диагностики
+                            self.logger.warning(f"    📋 Содержимое: {data}")
             
         except json.JSONDecodeError as e:
             self.logger.error(f"❌ Ошибка декодирования JSON: {e}")
+            self.logger.error(f"📋 Сырое сообщение: {message[:200]}...")
         except Exception as e:
             self.logger.error(f"❌ Ошибка обработки сообщения: {e}")
+            self.logger.error(f"📋 Тип: {type(message)}, длина: {len(message) if hasattr(message, '__len__') else 'unknown'}")
+            if hasattr(message, '__len__') and len(message) < 1000:
+                self.logger.error(f"📋 Содержимое: {message}")
     
     def _is_ticker_data(self, data: Dict) -> bool:
         """Проверить, является ли сообщение данными тикера"""
