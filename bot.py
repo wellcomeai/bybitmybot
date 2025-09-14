@@ -5,7 +5,10 @@ import requests
 import logging
 import signal
 import sys
+import os
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 from config import (
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, BYBIT_PUBLIC_WS, SYMBOL, 
     LOG_LEVEL, RECONNECT_DELAY, validate_config
@@ -22,19 +25,81 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Простой HTTP сервер для health check в Render"""
+    
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            stats = strategy.get_stats()
+            health_data = {
+                "status": "healthy",
+                "service": "crypto-bot",
+                "symbol": SYMBOL,
+                "total_signals": stats["total_signals"],
+                "last_signal": stats["last_signal"],
+                "last_price": stats["last_price"]
+            }
+            self.wfile.write(json.dumps(health_data).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+    
+    def log_message(self, format, *args):
+        # Отключаем логи HTTP сервера чтобы не засорять вывод
+        pass
+
+def start_health_server():
+    """Запуск HTTP сервера в отдельном потоке"""
+    port = int(os.environ.get('PORT', 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f"🏥 Health check сервер запущен на порту {port}")
+    server.serve_forever()
+
 class CryptoBot:
     def __init__(self):
         self.running = True
         self.reconnect_count = 0
         self.start_time = datetime.now()
+        self.startup_message_sent = False
         
-    def send_telegram(self, message: str):
+    def send_telegram_sync(self, message: str):
+        """Синхронная отправка сообщения в Telegram для случаев завершения работы"""
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    url, 
+                    data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+                    timeout=10
+                )
+                response.raise_for_status()
+                logger.debug(f"✅ Сообщение отправлено в Telegram: {message[:50]}...")
+                return True
+                
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"❌ Попытка {attempt + 1} отправки в Telegram неудачна: {e}")
+                if attempt < 2:
+                    import time
+                    time.sleep(2)
+        
+        logger.error(f"🚫 Не удалось отправить сообщение в Telegram: {message}")
+        return False
+    
+    async def send_telegram(self, message: str):
         """Отправка сообщения в Telegram с retry логикой"""
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         
         for attempt in range(3):  # 3 попытки
             try:
-                response = requests.post(
+                # Используем asyncio.to_thread для неблокирующего HTTP запроса
+                response = await asyncio.to_thread(
+                    requests.post,
                     url, 
                     data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
                     timeout=10
@@ -62,7 +127,7 @@ class CryptoBot:
             f"⏰ Время запуска: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"🌐 WebSocket: {BYBIT_PUBLIC_WS}"
         )
-        self.send_telegram(message)
+        await self.send_telegram(message)
     
     async def handle_websocket_data(self, data):
         """Обработка данных от WebSocket"""
@@ -84,7 +149,7 @@ class CryptoBot:
                         f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
                     )
                     logger.info(message.replace('\n', ' | '))
-                    await asyncio.to_thread(self.send_telegram, message)
+                    await self.send_telegram(message)
                     
         except (ValueError, KeyError) as e:
             logger.error(f"❌ Ошибка обработки данных: {e}")
@@ -146,6 +211,10 @@ class CryptoBot:
             logger.error(f"❌ Ошибка конфигурации: {e}")
             return
         
+        # Запускаем HTTP сервер для health check в отдельном потоке
+        health_thread = threading.Thread(target=start_health_server, daemon=True)
+        health_thread.start()
+        
         # Настраиваем обработчики сигналов для graceful shutdown
         def signal_handler(signum, frame):
             logger.info(f"📡 Получен сигнал {signum}. Завершение работы...")
@@ -169,7 +238,7 @@ class CryptoBot:
                 f"📊 Всего сигналов: {stats['total_signals']}\n"
                 f"🎯 Последний сигнал: {stats['last_signal'] or 'Нет'}"
             )
-            self.send_telegram(message)
+            self.send_telegram_sync(message)
             logger.info("👋 Бот завершил работу")
 
 def main():
