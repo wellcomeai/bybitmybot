@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import signal
 import sys
 import os
 import platform
@@ -33,6 +32,7 @@ class CryptoBot:
         self.startup_message_sent = False
         self.loop_iterations = 0
         self.last_heartbeat = datetime.now()
+        self.last_health_check = datetime.now()
         
         logger.info("🏗️ Инициализация CryptoBot...")
         logger.info(f"🏷️ Версия бота: 1.0.0 (модульная архитектура)")
@@ -60,7 +60,7 @@ class CryptoBot:
                 'reconnect_delay': RECONNECT_DELAY,
                 'ping_interval': 20,
                 'ping_timeout': 10,
-                'recv_timeout': 30
+                'recv_timeout': 60  # Увеличиваем таймаут
             }
             
             # Конфигурация для Telegram
@@ -114,7 +114,9 @@ class CryptoBot:
         symbol = price_event['symbol']
         price = price_event['price']
         
-        logger.debug(f"📊 {symbol}: ${price:,.2f}")
+        # Логируем цену только при DEBUG уровне
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"📊 {symbol}: ${price:,.2f}")
         
         # Проверяем стратегию
         try:
@@ -210,86 +212,6 @@ class CryptoBot:
         except Exception as e:
             logger.error(f"❌ Ошибка отключения коннекторов: {e}")
     
-    def _setup_signal_handlers(self):
-        """Настройка обработчиков сигналов для graceful shutdown с детальным логированием"""
-        
-        def signal_handler(signum, frame):
-            signal_names = {
-                2: 'SIGINT (Ctrl+C)',
-                15: 'SIGTERM (Graceful shutdown)',
-                9: 'SIGKILL (Force kill)',
-                1: 'SIGHUP (Hangup)',
-                3: 'SIGQUIT (Quit)',
-                6: 'SIGABRT (Abort)',
-            }
-            
-            signal_name = signal_names.get(signum, f'Unknown signal ({signum})')
-            
-            # Детальное логирование причины завершения
-            logger.warning("=" * 60)
-            logger.warning(f"🚨 ПОЛУЧЕН СИГНАЛ ЗАВЕРШЕНИЯ: {signal_name}")
-            logger.warning(f"📍 Место получения: {frame.f_code.co_filename}:{frame.f_lineno}")
-            logger.warning(f"⏱️ Время работы бота: {datetime.now() - self.start_time}")
-            logger.warning(f"🔄 Итераций главного цикла: {self.loop_iterations}")
-            logger.warning(f"💓 Последний heartbeat: {datetime.now() - self.last_heartbeat} назад")
-            
-            # Системная информация
-            try:
-                # Пытаемся импортировать psutil, если доступен
-                try:
-                    import psutil
-                    process = psutil.Process(os.getpid())
-                    memory_mb = process.memory_info().rss / 1024 / 1024
-                    cpu_percent = process.cpu_percent()
-                    logger.warning(f"💾 Использование памяти: {memory_mb:.1f} MB")
-                    logger.warning(f"🖥️ Использование CPU: {cpu_percent:.1f}%")
-                except ImportError:
-                    logger.debug("📊 psutil недоступен для мониторинга ресурсов")
-            except Exception as e:
-                logger.error(f"❌ Не удалось получить системную информацию: {e}")
-            
-            # Проверяем состояние коннекторов
-            logger.warning("📊 СОСТОЯНИЕ КОННЕКТОРОВ НА МОМЕНТ ЗАВЕРШЕНИЯ:")
-            
-            if hasattr(self, 'bybit_connector'):
-                try:
-                    bybit_stats = self.bybit_connector.get_stats()
-                    logger.warning(f"  🔗 Bybit: connected={bybit_stats.get('is_connected', False)}, "
-                                 f"messages={bybit_stats.get('total_messages', 0)}, "
-                                 f"reconnects={bybit_stats.get('reconnect_count', 0)}, "
-                                 f"last_price={bybit_stats.get('last_price', 'N/A')}")
-                except Exception as e:
-                    logger.error(f"❌ Не удалось получить статистику Bybit: {e}")
-            
-            if hasattr(self, 'telegram_connector'):
-                try:
-                    telegram_stats = self.telegram_connector.get_stats()
-                    logger.warning(f"  📱 Telegram: connected={telegram_stats.get('is_connected', False)}, "
-                                 f"sent={telegram_stats.get('messages_sent', 0)}, "
-                                 f"failed={telegram_stats.get('messages_failed', 0)}")
-                except Exception as e:
-                    logger.error(f"❌ Не удалось получить статистику Telegram: {e}")
-            
-            # Получаем статистику стратегии
-            try:
-                strategy_stats = strategy.get_stats()
-                logger.warning(f"  🎯 Strategy: signals={strategy_stats.get('total_signals', 0)}, "
-                             f"last_signal={strategy_stats.get('last_signal', 'None')}, "
-                             f"last_price={strategy_stats.get('last_price', 'N/A')}")
-            except Exception as e:
-                logger.error(f"❌ Не удалось получить статистику стратегии: {e}")
-            
-            logger.warning("🏁 Инициируется graceful shutdown...")
-            logger.warning("=" * 60)
-            self.running = False
-            
-        # Регистрируем обработчики для разных сигналов
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGHUP, signal_handler)
-        
-        logger.info("📡 Обработчики сигналов настроены (SIGINT, SIGTERM, SIGHUP)")
-    
     async def _send_shutdown_message(self):
         """Отправка сообщения о завершении работы"""
         try:
@@ -347,33 +269,63 @@ class CryptoBot:
             return {'error': str(e)}
     
     async def _health_check_loop(self):
-        """Периодическая проверка здоровья коннекторов"""
+        """Периодическая проверка здоровья коннекторов - УЛУЧШЕНО"""
         logger.info("🏥 Запуск health check цикла...")
-        check_interval = 30
+        check_interval = 30  # Проверяем каждые 30 секунд
+        recovery_attempts = 0
+        max_recovery_attempts = 3
         
         while self.running:
             try:
-                # Проверяем состояние коннекторов каждые 30 секунд
                 logger.debug("🩺 Выполняется health check...")
+                self.last_health_check = datetime.now()
                 
+                # Проверяем Bybit коннектор
                 bybit_healthy = await self.bybit_connector.is_healthy()
+                telegram_healthy = await self.telegram_connector.is_healthy()
+                
                 if not bybit_healthy:
                     logger.warning("⚠️ Bybit коннектор не здоров")
-                    # Дополнительная диагностика
                     bybit_stats = self.bybit_connector.get_stats()
                     logger.warning(f"🔍 Bybit диагностика: {bybit_stats}")
+                    
+                    # НОВАЯ ЛОГИКА: Попытка восстановления
+                    if recovery_attempts < max_recovery_attempts:
+                        recovery_attempts += 1
+                        logger.info(f"🔄 Попытка восстановления Bybit коннектора #{recovery_attempts}")
+                        
+                        try:
+                            # Переподключаем Bybit коннектор
+                            await self.bybit_connector.disconnect()
+                            await asyncio.sleep(5)
+                            await self.bybit_connector.connect()
+                            logger.info("✅ Восстановление Bybit коннектора завершено")
+                            
+                        except Exception as recovery_error:
+                            logger.error(f"❌ Ошибка восстановления Bybit: {recovery_error}")
+                    else:
+                        logger.error(f"🚨 Исчерпаны попытки восстановления Bybit коннектора ({max_recovery_attempts})")
                 
-                telegram_healthy = await self.telegram_connector.is_healthy()
                 if not telegram_healthy:
                     logger.warning("⚠️ Telegram коннектор не здоров")
-                    # Дополнительная диагностика
                     telegram_stats = self.telegram_connector.get_stats()
                     logger.warning(f"🔍 Telegram диагностика: {telegram_stats}")
+                    
+                    # Попытка переподключения Telegram
+                    try:
+                        await self.telegram_connector.connect()
+                        logger.info("✅ Восстановление Telegram коннектора")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка восстановления Telegram: {e}")
                 
-                # Если оба коннектора здоровы, логируем это только периодически
+                # Если оба коннектора здоровы, сбрасываем счетчик попыток
                 if bybit_healthy and telegram_healthy:
+                    if recovery_attempts > 0:
+                        logger.info("✅ Все коннекторы восстановлены")
+                        recovery_attempts = 0
+                    
                     # Логируем только каждые 10 минут при нормальной работе
-                    if self.loop_iterations % (10 * 60 / check_interval) == 0:
+                    if self.loop_iterations % (10 * 60 // check_interval) == 0:
                         logger.debug("✅ Все коннекторы здоровы")
                 
                 # Спим между проверками
@@ -412,9 +364,7 @@ class CryptoBot:
         health_thread.start()
         logger.info("🏥 Health check сервер запущен в отдельном потоке")
         
-        # Настраиваем обработчики сигналов
-        logger.info("📡 Настройка обработчиков сигналов...")
-        self._setup_signal_handlers()
+        # УБРАЛИ ДУБЛИРУЮЩИЕ ОБРАБОТЧИКИ СИГНАЛОВ - они будут только в main.py
         
         try:
             # Подключаем все коннекторы
