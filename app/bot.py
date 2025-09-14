@@ -8,7 +8,7 @@ from typing import Optional
 
 from config import (
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, BYBIT_PUBLIC_WS, SYMBOL, 
-    LOG_LEVEL, RECONNECT_DELAY, validate_config, BUY_LEVEL, SELL_LEVEL
+    LOG_LEVEL, RECONNECT_DELAY, validate_config
 )
 from strategy import strategy
 from connectors import BybitWebSocketConnector, TelegramConnector
@@ -35,6 +35,8 @@ class CryptoBot:
         
         # Настраиваем callbacks
         self._setup_callbacks()
+        
+        logger.info("🤖 CryptoBot инициализирован с модульной архитектурой")
         
     def _init_connectors(self):
         """Инициализация коннекторов"""
@@ -96,9 +98,12 @@ class CryptoBot:
         logger.debug(f"📊 {symbol}: ${price:,.2f}")
         
         # Проверяем стратегию
-        signal = strategy.check_signal(price)
-        if signal:
-            await self._send_signal_message(symbol, signal, price)
+        try:
+            signal = strategy.check_signal(price)
+            if signal:
+                await self._send_signal_message(symbol, signal, price)
+        except Exception as e:
+            logger.error(f"❌ Ошибка в стратегии: {e}")
     
     async def _send_startup_message(self):
         """Отправка сообщения о запуске"""
@@ -106,8 +111,8 @@ class CryptoBot:
             stats = strategy.get_stats()
             success = await self.telegram_connector.send_startup_message(
                 symbol=SYMBOL,
-                buy_level=stats['buy_level'],
-                sell_level=stats['sell_level'],
+                buy_level=stats.get('buy_level', 0),
+                sell_level=stats.get('sell_level', 0),
                 websocket_url=BYBIT_PUBLIC_WS
             )
             
@@ -198,8 +203,8 @@ class CryptoBot:
             success = await self.telegram_connector.send_shutdown_message(
                 uptime=uptime,
                 reconnect_count=reconnect_count,
-                total_signals=stats['total_signals'],
-                last_signal=stats['last_signal']
+                total_signals=stats.get('total_signals', 0),
+                last_signal=stats.get('last_signal')
             )
             
             if success:
@@ -237,6 +242,24 @@ class CryptoBot:
             logger.error(f"❌ Ошибка получения статистики: {e}")
             return {'error': str(e)}
     
+    async def _health_check_loop(self):
+        """Периодическая проверка здоровья коннекторов"""
+        while self.running:
+            try:
+                # Проверяем состояние коннекторов каждые 30 секунд
+                if not await self.bybit_connector.is_healthy():
+                    logger.warning("⚠️ Bybit коннектор не здоров")
+                
+                if not await self.telegram_connector.is_healthy():
+                    logger.warning("⚠️ Telegram коннектор не здоров")
+                
+                # Спим между проверками
+                await asyncio.sleep(30)
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка в health check: {e}")
+                await asyncio.sleep(5)
+    
     async def run(self):
         """Запуск бота"""
         logger.info("🚀 Запуск криптобота (модульная версия)...")
@@ -248,7 +271,7 @@ class CryptoBot:
             logger.error(f"❌ Ошибка конфигурации: {e}")
             return
         
-        # Запускаем HTTP сервер для health check
+        # Запускаем HTTP сервер для health check в отдельном потоке
         health_thread = threading.Thread(target=start_health_server, daemon=True)
         health_thread.start()
         
@@ -261,30 +284,37 @@ class CryptoBot:
                 logger.error("❌ Не удалось подключить коннекторы")
                 return
             
+            # Запускаем health check в отдельной задаче
+            health_task = asyncio.create_task(self._health_check_loop())
+            
             # Основной цикл работы
             logger.info("🟢 Бот запущен и готов к работе")
-            while self.running:
+            
+            try:
+                # Ждем завершения работы
+                while self.running:
+                    await asyncio.sleep(1)
+                    
+            except asyncio.CancelledError:
+                logger.info("⏹️ Получен сигнал отмены")
+            finally:
+                # Отменяем health check задачу
+                health_task.cancel()
                 try:
-                    # Проверяем состояние коннекторов
-                    if not await self.bybit_connector.is_healthy():
-                        logger.warning("⚠️ Bybit коннектор не здоров")
-                    
-                    if not await self.telegram_connector.is_healthy():
-                        logger.warning("⚠️ Telegram коннектор не здоров")
-                    
-                    # Спим между проверками
-                    await asyncio.sleep(30)
-                    
-                except Exception as e:
-                    logger.error(f"❌ Ошибка в основном цикле: {e}")
-                    await asyncio.sleep(5)
+                    await health_task
+                except asyncio.CancelledError:
+                    pass
             
         except KeyboardInterrupt:
             logger.info("⌨️ Получен Ctrl+C. Завершение работы...")
-        
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка в основном цикле: {e}")
         finally:
             # Отправляем сообщение о завершении
-            await self._send_shutdown_message()
+            try:
+                await self._send_shutdown_message()
+            except Exception as e:
+                logger.error(f"❌ Ошибка при отправке сообщения завершения: {e}")
             
             # Отключаем все коннекторы
             await self._disconnect_all()
