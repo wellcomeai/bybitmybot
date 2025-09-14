@@ -28,7 +28,7 @@ class CryptoBot:
         self.reconnect_count = 0
         self.start_time = datetime.now()
         
-    async def send_telegram(self, message: str):
+    def send_telegram(self, message: str):
         """Отправка сообщения в Telegram с retry логикой"""
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         
@@ -62,7 +62,7 @@ class CryptoBot:
             f"⏰ Время запуска: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"🌐 WebSocket: {BYBIT_PUBLIC_WS}"
         )
-        await self.send_telegram(message)
+        self.send_telegram(message)
     
     async def handle_websocket_data(self, data):
         """Обработка данных от WebSocket"""
@@ -84,7 +84,7 @@ class CryptoBot:
                         f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
                     )
                     logger.info(message.replace('\n', ' | '))
-                    await self.send_telegram(message)
+                    await asyncio.to_thread(self.send_telegram, message)
                     
         except (ValueError, KeyError) as e:
             logger.error(f"❌ Ошибка обработки данных: {e}")
@@ -107,9 +107,10 @@ class CryptoBot:
                     logger.info(f"✅ Подписка на тикеры {SYMBOL} успешна")
                     self.reconnect_count = 0  # Сбрасываем счетчик при успешном подключении
                     
-                    # Отправляем сообщение о запуске (только при первом подключении)
-                    if self.reconnect_count == 0:
+                    # Отправляем сообщение о запуске (только один раз)
+                    if not self.startup_message_sent:
                         await self.send_startup_message()
+                        self.startup_message_sent = True
                     
                     # Основной цикл получения данных
                     while self.running:
@@ -168,7 +169,7 @@ class CryptoBot:
                 f"📊 Всего сигналов: {stats['total_signals']}\n"
                 f"🎯 Последний сигнал: {stats['last_signal'] or 'Нет'}"
             )
-            await self.send_telegram(message)
+            self.send_telegram(message)
             logger.info("👋 Бот завершил работу")
 
 def main():
