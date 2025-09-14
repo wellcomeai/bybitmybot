@@ -2,6 +2,7 @@ import os
 import json
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime
 from config import SYMBOL
 
 # Импортируем стратегию
@@ -13,15 +14,18 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """HTTP обработчик для health check"""
+    """HTTP обработчик для health check - ИСПРАВЛЕНО ДЛЯ RENDER"""
     
     def do_GET(self):
         """Обработка GET запросов"""
         try:
             if self.path == '/health':
                 self._handle_health_check()
-            elif self.path == '/':
-                self._handle_root()
+            elif self.path == '/' or self.path == '':
+                # ИСПРАВЛЕНО: Render по умолчанию пингует `/` - делаем его простым health check
+                self._handle_simple_health_check()
+            elif self.path == '/dashboard':
+                self._handle_dashboard()
             elif self.path == '/ping':
                 self._handle_ping()
             else:
@@ -30,8 +34,33 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             logger.error(f"❌ Критическая ошибка в health handler: {e}")
             self._send_error_response(500, f"Internal server error: {str(e)}")
     
+    def _handle_simple_health_check(self):
+        """Простой health check для корневого пути - ДЛЯ RENDER"""
+        try:
+            # Render пингует `/` по умолчанию, возвращаем простой статус
+            health_data = {
+                "status": "healthy",
+                "service": "crypto-bot",
+                "timestamp": datetime.now().isoformat(),
+                "check_type": "simple"
+            }
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            
+            response_json = json.dumps(health_data, indent=2)
+            self.wfile.write(response_json.encode('utf-8'))
+            
+            logger.debug("✅ Simple health check (/) response sent")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in simple health check: {e}")
+            self._send_error_response(500, f"Simple health check failed: {str(e)}")
+    
     def _handle_health_check(self):
-        """Обработка /health endpoint"""
+        """Детальный health check endpoint"""
         try:
             stats = strategy.get_stats()
             health_data = {
@@ -41,8 +70,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 "total_signals": stats.get("total_signals", 0),
                 "last_signal": stats.get("last_signal"),
                 "last_price": stats.get("last_price"),
-                "version": "1.0.1",
-                "timestamp": "2025-09-14T10:08:15Z"
+                "version": "1.0.2",
+                "timestamp": datetime.now().isoformat(),
+                "check_type": "detailed"
             }
             
             self.send_response(200)
@@ -56,33 +86,21 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             response_json = json.dumps(health_data, indent=2)
             self.wfile.write(response_json.encode('utf-8'))
             
-            logger.debug(f"✅ Health check response sent: {len(response_json)} bytes")
+            logger.debug(f"✅ Detailed health check (/health) response sent: {len(response_json)} bytes")
             
         except Exception as e:
-            logger.error(f"❌ Error in health check: {e}")
+            logger.error(f"❌ Error in detailed health check: {e}")
             self._send_error_response(500, f"Health check failed: {str(e)}")
     
-    def _handle_ping(self):
-        """Обработка /ping endpoint для keep-alive"""
+    def _handle_dashboard(self):
+        """HTML Dashboard - перенесено с корневого пути"""  
         try:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Cache-Control', 'no-cache')
-            self.end_headers()
-            self.wfile.write(b'pong')
-            logger.debug("✅ Ping response sent")
-        except Exception as e:
-            logger.error(f"❌ Error in ping handler: {e}")
-    
-    def _handle_root(self):
-        """Обработка корневого пути - ИСПРАВЛЕНО"""
-        try:
-            # Используем простой HTML без format() чтобы избежать KeyError
+            stats = strategy.get_stats()
+            
             html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>Crypto Bot Status</title>
+    <title>Crypto Bot Dashboard</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
@@ -106,75 +124,80 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             border-radius: 8px;
             margin-bottom: 30px;
         }}
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .stat-card {{
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #007bff;
+        }}
         .endpoint {{
             margin: 15px 0;
             padding: 15px;
-            background: #f8f9fa;
-            border-left: 4px solid #007bff;
+            background: #e9ecef;
             border-radius: 4px;
         }}
-        .endpoint strong {{
-            color: #007bff;
-            font-family: 'Monaco', 'Menlo', monospace;
-        }}
         code {{
-            background: #e9ecef;
+            background: #d1ecf1;
             padding: 4px 8px;
             border-radius: 4px;
             font-family: 'Monaco', 'Menlo', monospace;
-            font-size: 0.9em;
-        }}
-        .symbol {{
-            font-weight: bold;
-            color: #28a745;
-            font-size: 1.2em;
-        }}
-        .footer {{
-            margin-top: 30px;
-            text-align: center;
-            color: #6c757d;
-            font-size: 0.9em;
         }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Crypto Trading Bot Status</h1>
+        <h1>🤖 Crypto Trading Bot Dashboard</h1>
         <div class="status">
-            <h2>✅ Bot is running successfully</h2>
-            <p>Monitoring symbol: <span class="symbol">{SYMBOL}</span></p>
-            <p>Version: 1.0.1 (Fixed Health Check)</p>
+            <h2>✅ Bot Status: Running</h2>
+            <p>Monitoring: <strong>{SYMBOL}</strong></p>
+            <p>Version: 1.0.2 (Fixed for Render)</p>
         </div>
         
-        <h3>📡 Available API Endpoints:</h3>
+        <div class="stats">
+            <div class="stat-card">
+                <h3>📊 Trading Stats</h3>
+                <p>Total Signals: <strong>{stats.get('total_signals', 0)}</strong></p>
+                <p>Last Signal: <strong>{stats.get('last_signal', 'None')}</strong></p>
+                <p>Last Price: <strong>${stats.get('last_price', 'N/A')}</strong></p>
+            </div>
+            <div class="stat-card">
+                <h3>🎯 Strategy Levels</h3>
+                <p>Buy Level: <strong>${stats.get('buy_level', 'N/A')}</strong></p>
+                <p>Sell Level: <strong>${stats.get('sell_level', 'N/A')}</strong></p>
+            </div>
+        </div>
+        
+        <h3>📡 API Endpoints:</h3>
         
         <div class="endpoint">
-            <strong>GET /health</strong><br>
-            <small>Returns comprehensive bot health status and statistics in JSON format</small>
+            <strong>GET /</strong> - Simple health check (JSON)<br>
+            <small>Used by Render for health monitoring</small>
         </div>
         
         <div class="endpoint">
-            <strong>GET /ping</strong><br>
-            <small>Keep-alive ping endpoint (returns "pong" for uptime monitoring)</small>
+            <strong>GET /health</strong> - Detailed health status (JSON)<br>
+            <small>Comprehensive bot statistics and health data</small>
         </div>
         
         <div class="endpoint">
-            <strong>GET /</strong><br>
-            <small>This status dashboard page</small>
+            <strong>GET /ping</strong> - Keep-alive endpoint<br>
+            <small>Returns "pong" for basic connectivity testing</small>
         </div>
         
-        <h3>🔧 Bot Features:</h3>
-        <ul>
-            <li>✅ Real-time WebSocket connection to Bybit</li>
-            <li>✅ Telegram notifications for trading signals</li>
-            <li>✅ Simple levels trading strategy</li>
-            <li>✅ Automatic reconnection and error handling</li>
-            <li>✅ Comprehensive health monitoring</li>
-            <li>✅ Fixed Render deployment issues</li>
-        </ul>
+        <div class="endpoint">
+            <strong>GET /dashboard</strong> - This HTML dashboard<br>
+            <small>Human-readable bot status and statistics</small>
+        </div>
         
-        <div class="footer">
-            <p>🚀 Deployed on Render • Last updated: 2025-09-14 • Fixed version</p>
+        <div style="margin-top: 30px; text-align: center; color: #6c757d;">
+            <p>🚀 Deployed on Render • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
+            <p><strong>Health Check Fix:</strong> Root path now returns JSON for Render compatibility</p>
         </div>
     </div>
 </body>
@@ -186,15 +209,39 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html_content.encode('utf-8'))
             
-            logger.debug("✅ Root page served successfully")
+            logger.debug("✅ Dashboard page served successfully")
             
         except Exception as e:
-            logger.error(f"❌ Error serving root page: {e}")
-            self._send_error_response(500, f"Root page error: {str(e)}")
+            logger.error(f"❌ Error serving dashboard: {e}")
+            self._send_error_response(500, f"Dashboard error: {str(e)}")
+    
+    def _handle_ping(self):
+        """Обработка /ping endpoint для keep-alive"""
+        try:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            self.wfile.write(b'pong')
+            logger.debug("✅ Ping response sent")
+        except Exception as e:
+            logger.error(f"❌ Error in ping handler: {e}")
     
     def _handle_not_found(self):
         """Обработка 404 ошибок"""
-        self._send_error_response(404, "Endpoint not found")
+        available_paths = ["/", "/health", "/ping", "/dashboard"]
+        error_data = {
+            "error": "Endpoint not found",
+            "status_code": 404,
+            "available_paths": available_paths,
+            "requested_path": self.path
+        }
+        
+        self.send_response(404)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(error_data, indent=2).encode('utf-8'))
     
     def _send_error_response(self, status_code: int, message: str):
         """Отправка ошибки"""
@@ -207,47 +254,53 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             error_data = {
                 "error": message,
                 "status_code": status_code,
-                "timestamp": "2025-09-14T10:08:15Z"
+                "timestamp": datetime.now().isoformat(),
+                "service": "crypto-bot"
             }
             self.wfile.write(json.dumps(error_data, indent=2).encode('utf-8'))
         except Exception as e:
             logger.error(f"❌ Failed to send error response: {e}")
     
     def log_message(self, format, *args):
-        """Отключаем стандартные логи HTTP сервера для чистоты вывода"""
-        pass
+        """Логируем только важные запросы"""
+        # Логируем health check запросы для диагностики
+        if 'health' in format or '/' in format:
+            logger.debug(f"🌐 HTTP: {format % args}")
 
 def start_health_server():
-    """Запуск HTTP сервера для health check - ИСПРАВЛЕНО ДЛЯ RENDER"""
+    """Запуск HTTP сервера для health check - RENDER COMPATIBLE"""
     try:
-        # ИСПРАВЛЕНО: Render по умолчанию использует порт 10000
-        # Используем переданный PORT или 10000 по умолчанию
+        # Render по умолчанию использует порт 10000
         port = int(os.environ.get('PORT', 10000))
         server_address = ('0.0.0.0', port)
         
-        logger.info(f"🏥 Запуск health check сервера для Render...")
-        logger.info(f"📡 Порт из переменной PORT: {os.environ.get('PORT', 'не установлена, используем 8080')}")
-        logger.info(f"📡 Слушаем адрес: {server_address[0]}:{server_address[1]}")
+        logger.info(f"🏥 Запуск Render-совместимого health сервера...")
+        logger.info(f"📡 PORT переменная: {os.environ.get('PORT', 'не установлена, используем 10000')}")
+        logger.info(f"📡 Слушаем: {server_address[0]}:{server_address[1]}")
+        logger.info(f"🎯 Корневой путь `/` возвращает JSON для Render health check")
         
-        # Создаем сервер
+        # Создаем и запускаем сервер
         server = HTTPServer(server_address, HealthCheckHandler)
-        logger.info(f"🏥 Health check сервер запущен успешно на порту {port}")
-        logger.info(f"📊 Доступные эндпоинты: /, /health, /ping")
-        logger.info(f"🌐 Внешний URL для проверки: https://your-app.render.com/health")
+        logger.info(f"✅ HTTP сервер запущен на порту {port}")
+        logger.info(f"📊 Доступные пути:")
+        logger.info(f"   GET / - простой health check (JSON)")
+        logger.info(f"   GET /health - детальный health check (JSON)") 
+        logger.info(f"   GET /ping - keep-alive test")
+        logger.info(f"   GET /dashboard - HTML dashboard")
         
-        # Запускаем сервер
+        # Запускаем сервер (блокирующий вызов)
         server.serve_forever()
         
     except Exception as e:
-        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА запуска health сервера: {e}")
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА HTTP сервера: {e}")
         logger.error(f"📋 Тип ошибки: {type(e).__name__}")
-        logger.error(f"📡 Порт из окружения: {os.environ.get('PORT', 'НЕ УСТАНОВЛЕНА')}")
+        logger.error(f"📡 Значение PORT: {os.environ.get('PORT', 'НЕ УСТАНОВЛЕНА')}")
         import traceback
         logger.error(f"📋 Traceback: {traceback.format_exc()}")
         raise
 
 if __name__ == "__main__":
     # Для тестирования health сервера отдельно
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     logger.info("🧪 Запуск health сервера в тестовом режиме...")
     start_health_server()
