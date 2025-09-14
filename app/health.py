@@ -41,7 +41,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 "total_signals": stats.get("total_signals", 0),
                 "last_signal": stats.get("last_signal"),
                 "last_price": stats.get("last_price"),
-                "version": "1.0.0",
+                "version": "1.0.1",
                 "timestamp": "2025-09-14T10:08:15Z"
             }
             
@@ -143,7 +143,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         <div class="status">
             <h2>✅ Bot is running successfully</h2>
             <p>Monitoring symbol: <span class="symbol">{SYMBOL}</span></p>
-            <p>Version: 1.0.0 (Modular Architecture)</p>
+            <p>Version: 1.0.1 (Fixed Health Check)</p>
         </div>
         
         <h3>📡 Available API Endpoints:</h3>
@@ -170,10 +170,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             <li>✅ Simple levels trading strategy</li>
             <li>✅ Automatic reconnection and error handling</li>
             <li>✅ Comprehensive health monitoring</li>
+            <li>✅ Fixed Render deployment issues</li>
         </ul>
         
         <div class="footer">
-            <p>🚀 Deployed on Render • Last updated: 2025-09-14</p>
+            <p>🚀 Deployed on Render • Last updated: 2025-09-14 • Fixed version</p>
         </div>
     </div>
 </body>
@@ -217,18 +218,22 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         pass
 
 def start_health_server():
-    """Запуск HTTP сервера для health check"""
+    """Запуск HTTP сервера для health check - ИСПРАВЛЕНО ДЛЯ RENDER"""
     try:
-        # Render использует переменную PORT, fallback на 10000
-        port = int(os.environ.get('PORT', 10000))
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: используем тот же порт что и в старой версии
+        # Render требует использовать именно переданный порт
+        port = int(os.environ.get('PORT', 8080))  # Изменено с 10000 на 8080
         server_address = ('0.0.0.0', port)
         
-        logger.info(f"🏥 Запуск health check сервера...")
-        logger.info(f"📡 Адрес: {server_address[0]}:{server_address[1]}")
+        logger.info(f"🏥 Запуск health check сервера для Render...")
+        logger.info(f"📡 Порт из переменной PORT: {os.environ.get('PORT', 'не установлена, используем 8080')}")
+        logger.info(f"📡 Слушаем адрес: {server_address[0]}:{server_address[1]}")
         
+        # Создаем сервер
         server = HTTPServer(server_address, HealthCheckHandler)
         logger.info(f"🏥 Health check сервер запущен успешно на порту {port}")
         logger.info(f"📊 Доступные эндпоинты: /, /health, /ping")
+        logger.info(f"🌐 Внешний URL для проверки: https://your-app.render.com/health")
         
         # Запускаем сервер
         server.serve_forever()
@@ -236,6 +241,7 @@ def start_health_server():
     except Exception as e:
         logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА запуска health сервера: {e}")
         logger.error(f"📋 Тип ошибки: {type(e).__name__}")
+        logger.error(f"📡 Порт из окружения: {os.environ.get('PORT', 'НЕ УСТАНОВЛЕНА')}")
         import traceback
         logger.error(f"📋 Traceback: {traceback.format_exc()}")
         raise
