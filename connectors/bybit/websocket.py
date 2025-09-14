@@ -17,12 +17,14 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
         self.reconnect_delay = config.get('reconnect_delay', 5)
         self.ping_interval = config.get('ping_interval', 20)
         self.ping_timeout = config.get('ping_timeout', 10)
-        self.recv_timeout = config.get('recv_timeout', 30)
+        self.recv_timeout = config.get('recv_timeout', 60)  # Увеличиваем таймаут
         
         # Статистика
         self.last_price = None
         self.last_update = None
         self.total_messages = 0
+        self.consecutive_errors = 0  # Счетчик последовательных ошибок
+        self.max_consecutive_errors = 5  # Максимум ошибок подряд
     
     async def connect(self) -> bool:
         """Установить WebSocket соединение"""
@@ -43,23 +45,26 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
         self.running = False
         
         if self.websocket:
-            await self.websocket.close()
-            
+            try:
+                await self.websocket.close()
+            except Exception as e:
+                self.logger.debug(f"Ошибка при закрытии WebSocket: {e}")
+                
         self.is_connected = False
         return True
     
     async def is_healthy(self) -> bool:
-        """Проверить состояние соединения"""
+        """Проверить состояние соединения - ИСПРАВЛЕНО"""
         if not self.running:
             return False
             
         if not self.is_connected:
             return False
             
-        # Проверяем, получали ли мы данные недавно
+        # Более мягкая проверка - данные должны обновляться чаще раза в 5 минут
         if self.last_update:
             time_since_update = (datetime.now() - self.last_update).seconds
-            return time_since_update < 60  # Данные должны обновляться чаще раза в минуту
+            return time_since_update < 300  # 5 минут вместо 60 секунд
             
         return False
     
@@ -68,12 +73,29 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
         while self.running:
             try:
                 await self._handle_websocket_connection()
+                # Если дошли сюда без исключения, сбрасываем счетчик ошибок
+                self.consecutive_errors = 0
+                
             except Exception as e:
                 if self.running:
+                    self.consecutive_errors += 1
                     self.reconnect_count += 1
-                    self.logger.error(f"❌ Ошибка соединения: {e}. Переподключение #{self.reconnect_count} через {self.reconnect_delay}с...")
+                    
+                    # Увеличиваем задержку при последовательных ошибках
+                    delay = min(self.reconnect_delay * self.consecutive_errors, 60)
+                    
+                    self.logger.error(f"❌ Ошибка соединения #{self.consecutive_errors}: {e}")
+                    self.logger.info(f"🔄 Переподключение #{self.reconnect_count} через {delay}с...")
+                    
                     self.is_connected = False
-                    await asyncio.sleep(self.reconnect_delay)
+                    
+                    # Если слишком много ошибок подряд, увеличиваем паузу
+                    if self.consecutive_errors >= self.max_consecutive_errors:
+                        self.logger.warning(f"⚠️ Слишком много ошибок подряд ({self.consecutive_errors}), увеличиваем паузу")
+                        await asyncio.sleep(120)  # 2 минуты паузы
+                        self.consecutive_errors = 0  # Сбрасываем счетчик
+                    else:
+                        await asyncio.sleep(delay)
     
     async def _handle_websocket_connection(self):
         """Обработка одного WebSocket соединения"""
@@ -111,7 +133,7 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
         self.logger.debug(f"📡 Отправлена подписка: {subscription_message}")
     
     async def _message_loop(self):
-        """Основной цикл получения сообщений"""
+        """Основной цикл получения сообщений - УЛУЧШЕНО"""
         while self.running and self.is_connected:
             try:
                 # Получаем сообщение с таймаутом
@@ -124,8 +146,13 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
                 await self._handle_message(message)
                 
             except asyncio.TimeoutError:
-                self.logger.warning("⏱️ Таймаут получения данных, отправляем ping...")
-                await self.websocket.ping()
+                # При таймауте не считаем это критической ошибкой
+                self.logger.debug("⏱️ Таймаут получения данных, отправляем ping...")
+                try:
+                    await self.websocket.ping()
+                except Exception as ping_error:
+                    self.logger.warning(f"❌ Ошибка ping: {ping_error}")
+                    break  # Выходим из цикла, произойдет переподключение
             
             except websockets.exceptions.ConnectionClosed:
                 self.logger.warning("🔌 WebSocket соединение закрыто")
@@ -139,8 +166,9 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
             self.total_messages += 1
             self.last_update = datetime.now()
             
-            # Логируем сырые данные для дебага
-            self.logger.debug(f"📨 Получено сообщение: {message[:100]}...")
+            # Логируем сырые данные для дебага только если уровень DEBUG
+            if self.logger.isEnabledFor(10):  # DEBUG level
+                self.logger.debug(f"📨 Получено сообщение: {message[:100]}...")
             
             # Обрабатываем данные тикеров
             if self._is_ticker_data(data):
@@ -180,8 +208,9 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
                 'raw_data': ticker_data
             }
             
-            # Логируем цену
-            self.logger.debug(f"📊 {self.symbol}: ${price:,.2f}")
+            # Логируем цену только при DEBUG уровне
+            if self.logger.isEnabledFor(10):  # DEBUG level
+                self.logger.debug(f"📊 {self.symbol}: ${price:,.2f}")
             
             # Эмитим событие новой цены
             await self._emit_event('price_update', price_event)
@@ -194,11 +223,12 @@ class BybitWebSocketConnector(BaseWebSocketConnector):
         return {
             'name': self.name,
             'is_connected': self.is_connected,
-            'is_healthy': asyncio.create_task(self.is_healthy()) if self.running else False,
             'reconnect_count': self.reconnect_count,
             'total_messages': self.total_messages,
+            'consecutive_errors': self.consecutive_errors,
             'last_price': self.last_price,
             'last_update': self.last_update.isoformat() if self.last_update else None,
             'symbol': self.symbol,
-            'websocket_url': self.websocket_url
+            'websocket_url': self.websocket_url,
+            'health_timeout': 300  # В секундах
         }
