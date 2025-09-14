@@ -1,18 +1,17 @@
 import asyncio
-import websockets
-import json
-import requests
 import logging
 import signal
 import sys
 import threading
 from datetime import datetime
+from typing import Optional
 
 from config import (
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, BYBIT_PUBLIC_WS, SYMBOL, 
-    LOG_LEVEL, RECONNECT_DELAY, validate_config
+    LOG_LEVEL, RECONNECT_DELAY, validate_config, BUY_LEVEL, SELL_LEVEL
 )
 from strategy import strategy
+from connectors import BybitWebSocketConnector, TelegramConnector
 from .health import start_health_server
 
 # Настройка логирования
@@ -24,145 +23,159 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class CryptoBot:
-    """Основной класс криптобота"""
+    """Основной класс криптобота с модульной архитектурой"""
     
     def __init__(self):
         self.running = True
-        self.reconnect_count = 0
         self.start_time = datetime.now()
         self.startup_message_sent = False
         
-    def send_telegram_sync(self, message: str) -> bool:
-        """Синхронная отправка сообщения в Telegram"""
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        # Инициализируем коннекторы
+        self._init_connectors()
         
-        for attempt in range(3):
-            try:
-                response = requests.post(
-                    url, 
-                    data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
-                    timeout=10
-                )
-                response.raise_for_status()
-                logger.debug(f"✅ Сообщение отправлено в Telegram: {message[:50]}...")
-                return True
-                
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"❌ Попытка {attempt + 1} отправки в Telegram неудачна: {e}")
-                if attempt < 2:
-                    import time
-                    time.sleep(2)
+        # Настраиваем callbacks
+        self._setup_callbacks()
         
-        logger.error(f"🚫 Не удалось отправить сообщение в Telegram: {message}")
-        return False
-    
-    async def send_telegram(self, message: str) -> bool:
-        """Асинхронная отправка сообщения в Telegram"""
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        
-        for attempt in range(3):
-            try:
-                response = await asyncio.to_thread(
-                    requests.post,
-                    url, 
-                    data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
-                    timeout=10
-                )
-                response.raise_for_status()
-                logger.debug(f"✅ Сообщение отправлено в Telegram: {message[:50]}...")
-                return True
-                
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"❌ Попытка {attempt + 1} отправки в Telegram неудачна: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(2)
-        
-        logger.error(f"🚫 Не удалось отправить сообщение в Telegram: {message}")
-        return False
-    
-    async def send_startup_message(self):
-        """Отправка сообщения о запуске бота"""
-        stats = strategy.get_stats()
-        message = (
-            f"🤖 Крипто-бот запущен!\n\n"
-            f"📊 Символ: {SYMBOL}\n"
-            f"📈 Уровень покупки: {stats['buy_level']}\n"
-            f"📉 Уровень продажи: {stats['sell_level']}\n"
-            f"⏰ Время запуска: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"🌐 WebSocket: {BYBIT_PUBLIC_WS}"
-        )
-        await self.send_telegram(message)
-    
-    async def handle_websocket_data(self, data):
-        """Обработка данных от WebSocket"""
+    def _init_connectors(self):
+        """Инициализация коннекторов"""
         try:
-            if "data" in data and isinstance(data["data"], dict):
-                price_str = data["data"].get("lastPrice")
-                if not price_str:
-                    return
-                    
-                price = float(price_str)
-                logger.debug(f"📊 {SYMBOL}: {price}")
-                
-                signal = strategy.check_signal(price)
-                if signal:
-                    message = (
-                        f"🚀 СИГНАЛ по {SYMBOL}\n\n"
-                        f"📊 Действие: {signal}\n"
-                        f"💰 Цена: ${price:,.2f}\n"
-                        f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
-                    )
-                    logger.info(message.replace('\n', ' | '))
-                    await self.send_telegram(message)
-                    
-        except (ValueError, KeyError) as e:
-            logger.error(f"❌ Ошибка обработки данных: {e}")
+            # Конфигурация для Bybit WebSocket
+            bybit_config = {
+                'websocket_url': BYBIT_PUBLIC_WS,
+                'symbol': SYMBOL,
+                'reconnect_delay': RECONNECT_DELAY,
+                'ping_interval': 20,
+                'ping_timeout': 10,
+                'recv_timeout': 30
+            }
+            
+            # Конфигурация для Telegram
+            telegram_config = {
+                'bot_token': TELEGRAM_TOKEN,
+                'chat_id': TELEGRAM_CHAT_ID,
+                'timeout': 10,
+                'max_retries': 3,
+                'retry_delay': 2
+            }
+            
+            # Создаем коннекторы
+            self.bybit_connector = BybitWebSocketConnector(bybit_config)
+            self.telegram_connector = TelegramConnector(telegram_config)
+            
+            logger.info("✅ Коннекторы инициализированы")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации коннекторов: {e}")
+            raise
     
-    async def websocket_handler(self):
-        """Основной обработчик WebSocket соединения"""
-        while self.running:
-            try:
-                logger.info(f"🔗 Подключение к {BYBIT_PUBLIC_WS}...")
+    def _setup_callbacks(self):
+        """Настройка callbacks для событий коннекторов"""
+        
+        # Подписываемся на события подключения
+        self.bybit_connector.add_callback('connected', self._on_bybit_connected)
+        
+        # Подписываемся на обновления цен
+        self.bybit_connector.add_callback('price_update', self._on_price_update)
+        
+        logger.debug("✅ Callbacks настроены")
+    
+    async def _on_bybit_connected(self, data):
+        """Обработчик события подключения к Bybit"""
+        logger.info(f"🔗 Подключен к Bybit: {data['symbol']} @ {data['websocket_url']}")
+        
+        # Отправляем сообщение о запуске (только один раз)
+        if not self.startup_message_sent:
+            await self._send_startup_message()
+            self.startup_message_sent = True
+    
+    async def _on_price_update(self, price_event):
+        """Обработчик обновления цены"""
+        symbol = price_event['symbol']
+        price = price_event['price']
+        
+        logger.debug(f"📊 {symbol}: ${price:,.2f}")
+        
+        # Проверяем стратегию
+        signal = strategy.check_signal(price)
+        if signal:
+            await self._send_signal_message(symbol, signal, price)
+    
+    async def _send_startup_message(self):
+        """Отправка сообщения о запуске"""
+        try:
+            stats = strategy.get_stats()
+            success = await self.telegram_connector.send_startup_message(
+                symbol=SYMBOL,
+                buy_level=stats['buy_level'],
+                sell_level=stats['sell_level'],
+                websocket_url=BYBIT_PUBLIC_WS
+            )
+            
+            if success:
+                logger.info("📱 Сообщение о запуске отправлено")
+            else:
+                logger.warning("⚠️ Не удалось отправить сообщение о запуске")
                 
-                async with websockets.connect(
-                    BYBIT_PUBLIC_WS,
-                    ping_interval=20,
-                    ping_timeout=10
-                ) as ws:
-                    # Подписываемся на тикеры
-                    sub_msg = {"op": "subscribe", "args": [f"tickers.{SYMBOL}"]}
-                    await ws.send(json.dumps(sub_msg))
-                    
-                    logger.info(f"✅ Подписка на тикеры {SYMBOL} успешна")
-                    self.reconnect_count = 0
-                    
-                    # Отправляем сообщение о запуске
-                    if not self.startup_message_sent:
-                        await self.send_startup_message()
-                        self.startup_message_sent = True
-                    
-                    # Основной цикл получения данных
-                    while self.running:
-                        try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=30)
-                            data = json.loads(msg)
-                            await self.handle_websocket_data(data)
-                            
-                        except asyncio.TimeoutError:
-                            logger.warning("⏱️ Таймаут получения данных, отправляем ping...")
-                            await ws.ping()
-                            
-            except websockets.exceptions.ConnectionClosed:
-                if self.running:
-                    self.reconnect_count += 1
-                    logger.warning(f"🔌 Соединение закрыто. Переподключение #{self.reconnect_count} через {RECONNECT_DELAY}с...")
-                    await asyncio.sleep(RECONNECT_DELAY)
-                    
-            except Exception as e:
-                if self.running:
-                    self.reconnect_count += 1
-                    logger.error(f"❌ Ошибка WebSocket: {e}. Переподключение #{self.reconnect_count} через {RECONNECT_DELAY}с...")
-                    await asyncio.sleep(RECONNECT_DELAY)
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки сообщения о запуске: {e}")
+    
+    async def _send_signal_message(self, symbol: str, action: str, price: float):
+        """Отправка торгового сигнала"""
+        try:
+            success = await self.telegram_connector.send_signal_message(
+                symbol=symbol,
+                action=action,
+                price=price
+            )
+            
+            if success:
+                logger.info(f"🚀 Сигнал отправлен: {action} {symbol} @ ${price:,.2f}")
+            else:
+                logger.warning(f"⚠️ Не удалось отправить сигнал: {action} {symbol}")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки сигнала: {e}")
+    
+    async def _connect_all(self) -> bool:
+        """Подключение всех коннекторов"""
+        logger.info("🔗 Подключение коннекторов...")
+        
+        try:
+            # Подключаем Telegram
+            telegram_connected = await self.telegram_connector.connect()
+            if not telegram_connected:
+                logger.error("❌ Не удалось подключиться к Telegram")
+                return False
+            
+            # Подключаем Bybit WebSocket
+            bybit_connected = await self.bybit_connector.connect()
+            if not bybit_connected:
+                logger.error("❌ Не удалось подключиться к Bybit")
+                return False
+            
+            logger.info("✅ Все коннекторы подключены")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения коннекторов: {e}")
+            return False
+    
+    async def _disconnect_all(self):
+        """Отключение всех коннекторов"""
+        logger.info("🔌 Отключение коннекторов...")
+        
+        try:
+            # Отключаем коннекторы
+            if hasattr(self, 'bybit_connector'):
+                await self.bybit_connector.disconnect()
+            
+            if hasattr(self, 'telegram_connector'):
+                await self.telegram_connector.disconnect()
+            
+            logger.info("✅ Все коннекторы отключены")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка отключения коннекторов: {e}")
     
     def _setup_signal_handlers(self):
         """Настройка обработчиков сигналов для graceful shutdown"""
@@ -173,9 +186,60 @@ class CryptoBot:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
     
+    async def _send_shutdown_message(self):
+        """Отправка сообщения о завершении работы"""
+        try:
+            uptime = str(datetime.now() - self.start_time)
+            stats = strategy.get_stats()
+            
+            # Получаем статистику коннекторов
+            reconnect_count = getattr(self.bybit_connector, 'reconnect_count', 0)
+            
+            success = await self.telegram_connector.send_shutdown_message(
+                uptime=uptime,
+                reconnect_count=reconnect_count,
+                total_signals=stats['total_signals'],
+                last_signal=stats['last_signal']
+            )
+            
+            if success:
+                logger.info("📱 Сообщение о завершении отправлено")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки сообщения о завершении: {e}")
+    
+    def get_bot_stats(self) -> dict:
+        """Получить статистику бота для health check"""
+        try:
+            strategy_stats = strategy.get_stats()
+            
+            bybit_stats = {}
+            if hasattr(self, 'bybit_connector'):
+                bybit_stats = self.bybit_connector.get_stats()
+            
+            telegram_stats = {}
+            if hasattr(self, 'telegram_connector'):
+                telegram_stats = self.telegram_connector.get_stats()
+            
+            return {
+                'bot': {
+                    'running': self.running,
+                    'uptime': str(datetime.now() - self.start_time),
+                    'startup_message_sent': self.startup_message_sent
+                },
+                'strategy': strategy_stats,
+                'connectors': {
+                    'bybit': bybit_stats,
+                    'telegram': telegram_stats
+                }
+            }
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики: {e}")
+            return {'error': str(e)}
+    
     async def run(self):
         """Запуск бота"""
-        logger.info("🚀 Запуск крипто-бота...")
+        logger.info("🚀 Запуск криптобота (модульная версия)...")
         
         try:
             # Проверяем конфигурацию
@@ -192,19 +256,37 @@ class CryptoBot:
         self._setup_signal_handlers()
         
         try:
-            await self.websocket_handler()
+            # Подключаем все коннекторы
+            if not await self._connect_all():
+                logger.error("❌ Не удалось подключить коннекторы")
+                return
+            
+            # Основной цикл работы
+            logger.info("🟢 Бот запущен и готов к работе")
+            while self.running:
+                try:
+                    # Проверяем состояние коннекторов
+                    if not await self.bybit_connector.is_healthy():
+                        logger.warning("⚠️ Bybit коннектор не здоров")
+                    
+                    if not await self.telegram_connector.is_healthy():
+                        logger.warning("⚠️ Telegram коннектор не здоров")
+                    
+                    # Спим между проверками
+                    await asyncio.sleep(30)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Ошибка в основном цикле: {e}")
+                    await asyncio.sleep(5)
+            
         except KeyboardInterrupt:
             logger.info("⌨️ Получен Ctrl+C. Завершение работы...")
+        
         finally:
-            # Отправляем сообщение о завершении работы
-            uptime = datetime.now() - self.start_time
-            stats = strategy.get_stats()
-            message = (
-                f"🛑 Крипто-бот остановлен\n\n"
-                f"⏱️ Время работы: {uptime}\n"
-                f"🔄 Переподключений: {self.reconnect_count}\n"
-                f"📊 Всего сигналов: {stats['total_signals']}\n"
-                f"🎯 Последний сигнал: {stats['last_signal'] or 'Нет'}"
-            )
-            self.send_telegram_sync(message)
+            # Отправляем сообщение о завершении
+            await self._send_shutdown_message()
+            
+            # Отключаем все коннекторы
+            await self._disconnect_all()
+            
             logger.info("👋 Бот завершил работу")
