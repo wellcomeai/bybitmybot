@@ -3,7 +3,6 @@ import json
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from config import SYMBOL
-from strategy import strategy
 
 logger = logging.getLogger(__name__)
 
